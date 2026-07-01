@@ -17,10 +17,10 @@ function fmt_customer($r) {
         'name' => $r['name'],
         'email' => $r['email'],
         'phone' => $r['phone'],
-        'address' => $r['address'] ?? '',
-        'city' => $r['city'] ?? '',
-        'postalCode' => $r['postal_code'] ?? '',
-        'deliveryNotes' => $r['delivery_notes'] ?? '',
+        'address' => isset($r['address']) ? $r['address'] : '',
+        'city' => isset($r['city']) ? $r['city'] : '',
+        'postalCode' => isset($r['postal_code']) ? $r['postal_code'] : '',
+        'deliveryNotes' => isset($r['delivery_notes']) ? $r['delivery_notes'] : '',
         'totalOrders' => (int)$r['total_orders'],
         'totalSpend' => (float)$r['total_spend'],
     );
@@ -68,10 +68,10 @@ if ($method === 'PATCH' && $id) {
         'name' => ga($body, 'name', $existing['name']),
         'email' => ga($body, 'email', $existing['email']),
         'phone' => ga($body, 'phone', $existing['phone']),
-        'address' => ga($body, 'address', $existing['address']),
-        'city' => ga($body, 'city', $existing['city']),
-        'postal_code' => ga($body, 'postalCode', $existing['postal_code']),
-        'delivery_notes' => ga($body, 'deliveryNotes', $existing['delivery_notes']),
+        'address' => ga($body, 'address', isset($existing['address']) ? $existing['address'] : ''),
+        'city' => ga($body, 'city', isset($existing['city']) ? $existing['city'] : ''),
+        'postal_code' => ga($body, 'postalCode', isset($existing['postal_code']) ? $existing['postal_code'] : ''),
+        'delivery_notes' => ga($body, 'deliveryNotes', isset($existing['delivery_notes']) ? $existing['delivery_notes'] : ''),
     );
     $upd = $pdo->prepare("UPDATE customers SET name=?, email=?, phone=?, address=?, city=?, postal_code=?, delivery_notes=? WHERE id = ?");
     $upd->execute(array(
