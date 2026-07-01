@@ -21,6 +21,10 @@ function fetch_order_with_items($pdo, $id) {
         'orderNumber' => $o['order_number'],
         'customerId' => $o['customer_id'],
         'customerName' => $o['customer_name'],
+        'customerAddress' => $o['customer_address'] ?? '',
+        'customerCity' => $o['customer_city'] ?? '',
+        'customerPhone' => $o['customer_phone'] ?? '',
+        'deliveryNotes' => $o['delivery_notes'] ?? '',
         'items' => $items,
         'total' => (float)$o['total'],
         'status' => $o['status'],
@@ -50,6 +54,10 @@ if ($method === 'POST') {
     $body = json_body();
     $customerName = trim(ga($body, 'customerName', ''));
     $customerId = ga($body, 'customerId', null);
+    $customerAddress = ga($body, 'customerAddress', '');
+    $customerCity = ga($body, 'customerCity', '');
+    $customerPhone = ga($body, 'customerPhone', '');
+    $deliveryNotes = ga($body, 'deliveryNotes', '');
     $items = ga($body, 'items', array());
     $paymentMethod = ga($body, 'paymentMethod', 'offline');
     if (!in_array($paymentMethod, array('online', 'offline'), true)) {
@@ -74,10 +82,22 @@ if ($method === 'POST') {
     $pdo->beginTransaction();
     try {
         $stmt = $pdo->prepare(
-            "INSERT INTO orders (id, order_number, customer_id, customer_name, total, status, payment_method, created_at)
-             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)"
+            "INSERT INTO orders (id, order_number, customer_id, customer_name, customer_address, customer_city, customer_phone, delivery_notes, total, status, payment_method, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)"
         );
-        $stmt->execute(array($newId, $orderNumber, $customerId ? $customerId : null, $customerName, $total, $paymentMethod, $now));
+        $stmt->execute(array(
+            $newId,
+            $orderNumber,
+            $customerId ? $customerId : null,
+            $customerName,
+            $customerAddress,
+            $customerCity,
+            $customerPhone,
+            $deliveryNotes,
+            $total,
+            $paymentMethod,
+            $now
+        ));
 
         $itemStmt = $pdo->prepare("INSERT INTO order_items (order_id, name, qty, price) VALUES (?, ?, ?, ?)");
         foreach ($items as $it) {
