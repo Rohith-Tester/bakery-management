@@ -8,6 +8,13 @@ define('DB_NAME', 'bakery_db');
 define('DB_USER', 'root');
 define('DB_PASS', '');
 
+// Every date/time the app stores or shows is Indian Standard Time — both
+// PHP's date() and MySQL's NOW()/CURRENT_TIMESTAMP — whatever timezone the
+// server itself is set to (XAMPP's php.ini ships with Europe/Berlin, and
+// hosting providers usually run MySQL in UTC).
+define('APP_TIMEZONE', 'Asia/Kolkata');
+date_default_timezone_set(APP_TIMEZONE);
+
 function db() {
     static $pdo = null;
     if ($pdo === null) {
@@ -22,6 +29,9 @@ function db() {
                     PDO::ATTR_EMULATE_PREPARES   => false,
                 )
             );
+            // Numeric offset (e.g. "+05:30"), not a zone name — MySQL only
+            // understands names if its timezone tables have been loaded.
+            $pdo->exec("SET time_zone = '" . date('P') . "'");
         } catch (PDOException $e) {
             http_response_code(500);
             header('Content-Type: application/json');

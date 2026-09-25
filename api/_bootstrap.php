@@ -38,9 +38,11 @@ require_once __DIR__ . '/../config/db.php';
 // track.php (the public order-tracking lookup customers use without an
 // account), and settings.php (bakery contact details shown to anyone
 // deciding whether to call in an order instead of ordering online —
-// settings.php enforces its own admin check for writes/PATCH).
+// settings.php enforces its own admin check for writes/PATCH), and
+// razorpay_webhook.php (called by Razorpay's servers, authenticated by
+// its signature instead of a session).
 $__self = basename($_SERVER['SCRIPT_NAME']);
-$__publicEndpoints = array('auth.php', 'track.php', 'settings.php', 'returns.php');
+$__publicEndpoints = array('auth.php', 'track.php', 'settings.php', 'returns.php', 'razorpay_webhook.php');
 if (!in_array($__self, $__publicEndpoints, true) && empty($_SESSION['user_id'])) {
     http_response_code(401);
     echo json_encode(array('error' => 'Not authenticated'));
@@ -137,6 +139,107 @@ function evaluate_coupon($pdo, $code, $subtotal, $userId) {
     $discount = round($discount, 2);
 
     return array('ok' => true, 'discountAmount' => $discount, 'coupon' => $c);
+}
+
+// Flat delivery charge added to every home-delivery order, whatever the
+// payment method (store pickup is never charged).
+define('DELIVERY_CHARGE', 50.00);
+
+// Prices an order request exactly the way it will be saved, returning
+// ['ok'=>true,'total'=>N,'trustedPriceByName'=>…,'inventoryNeeded'=>…,
+//  'discountAmount'=>N,'couponCode'=>…,'deliveryCharge'=>N] or
+// ['ok'=>false,'error'=>msg]. Shared by api/orders.php (saving the order)
+// and api/payments.php (opening a Razorpay payment for it), so what a
+// customer is charged online is always what the order is created for.
+function quote_order($pdo, $items, $couponCode, $deliveryType, $userId) {
+    // ── Validate items against the Product Catalog (not raw inventory —
+    //    customers order finished products, e.g. "Chocolate Cake", never
+    //    raw ingredients like "Flour"). Stock availability is derived from
+    //    each product's linked Recipe: if a product has a recipe, the
+    //    order can't exceed how many units that recipe's ingredients can
+    //    currently produce. Products with no recipe linked yet are treated
+    //    as stock-untracked (always orderable while marked available). ──
+    $neededByName = array();
+    foreach ($items as $it) {
+        $name = trim(ga($it, 'name', ''));
+        $qty = (float)ga($it, 'qty', 0);
+        if ($name === '' || $qty <= 0) continue;
+        $neededByName[$name] = (isset($neededByName[$name]) ? $neededByName[$name] : 0) + $qty;
+    }
+
+    // Price is NEVER trusted from the client — it's recomputed here from
+    // each item's real Product Catalog selling_price. This closes off the
+    // obvious attack of editing the request to set an arbitrary/zero price.
+    $trustedPriceByName = array();
+    $productByName = array();
+    foreach ($neededByName as $name => $need) {
+        $prodStmt = $pdo->prepare("SELECT * FROM products WHERE name = ? AND is_available = 1");
+        $prodStmt->execute(array($name));
+        $prodRow = $prodStmt->fetch();
+        $trustedPriceByName[$name] = $prodRow ? (float)$prodRow['selling_price'] : 0;
+        $productByName[$name] = $prodRow ?: null;
+    }
+
+    foreach ($neededByName as $name => $need) {
+        if (!$productByName[$name]) {
+            return array('ok' => false, 'error' => '"' . $name . '" is not a valid or available product');
+        }
+    }
+
+    // Expand each product's ordered quantity into raw-ingredient demand via
+    // its linked recipe (quantity per ingredient is defined per recipe
+    // batch, which yields yield_qty finished units).
+    $inventoryNeeded = array(); // item_id => quantity needed
+    foreach ($neededByName as $name => $need) {
+        $prodRow = $productByName[$name];
+        if (!$prodRow || !$prodRow['recipe_id']) continue; // stock-untracked product
+        $ingStmt = $pdo->prepare(
+            "SELECT ri.item_id, ri.quantity, r.yield_qty FROM recipe_ingredients ri
+             JOIN recipes r ON r.id = ri.recipe_id WHERE ri.recipe_id = ?"
+        );
+        $ingStmt->execute(array($prodRow['recipe_id']));
+        foreach ($ingStmt->fetchAll() as $ing) {
+            $yieldQty = (float)$ing['yield_qty'] > 0 ? (float)$ing['yield_qty'] : 1;
+            $perUnit = (float)$ing['quantity'] / $yieldQty;
+            $itemId = $ing['item_id'];
+            $inventoryNeeded[$itemId] = (isset($inventoryNeeded[$itemId]) ? $inventoryNeeded[$itemId] : 0) + ($perUnit * $need);
+        }
+    }
+
+    $total = 0;
+    foreach ($items as $it) {
+        $name = trim(ga($it, 'name', ''));
+        $qty = (float)ga($it, 'qty', 0);
+        $price = isset($trustedPriceByName[$name]) ? $trustedPriceByName[$name] : 0;
+        $total += $price * $qty;
+    }
+
+    // Coupon discount applies to the items subtotal, before the delivery
+    // charge is added — re-validated here from scratch (never trust a
+    // discount amount computed client-side) using the exact same rules the
+    // live checkout-time check in api/coupons.php used.
+    $discountAmount = 0;
+    $appliedCouponCode = null;
+    if ($couponCode !== '') {
+        $couponResult = evaluate_coupon($pdo, $couponCode, $total, $userId);
+        if (!$couponResult['ok']) return $couponResult;
+        $discountAmount = $couponResult['discountAmount'];
+        $appliedCouponCode = $couponResult['coupon']['code'];
+        $total -= $discountAmount;
+    }
+
+    $deliveryCharge = ($deliveryType === 'delivery') ? DELIVERY_CHARGE : 0.00;
+    $total += $deliveryCharge;
+
+    return array(
+        'ok' => true,
+        'total' => $total,
+        'trustedPriceByName' => $trustedPriceByName,
+        'inventoryNeeded' => $inventoryNeeded,
+        'discountAmount' => $discountAmount,
+        'couponCode' => $appliedCouponCode,
+        'deliveryCharge' => $deliveryCharge,
+    );
 }
 
 // Catch any uncaught error/exception and turn it into a JSON error instead of

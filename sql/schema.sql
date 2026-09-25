@@ -5,6 +5,7 @@ CREATE DATABASE IF NOT EXISTS bakery_db CHARACTER SET utf8mb4 COLLATE utf8mb4_un
 USE bakery_db;
 
 -- ── Customers ────────────────────────────────────────────────────────────
+DROP TABLE IF EXISTS payments;
 DROP TABLE IF EXISTS invoices;
 DROP TABLE IF EXISTS order_items;
 DROP TABLE IF EXISTS orders;
@@ -290,6 +291,7 @@ CREATE TABLE orders (
   payment_method ENUM('online','offline') NOT NULL DEFAULT 'offline',
   payment_txn_id VARCHAR(40) DEFAULT '',
   payment_card_last4 VARCHAR(4) DEFAULT '',
+  payment_mode VARCHAR(20) DEFAULT '',
   delivery_partner_name VARCHAR(150) DEFAULT '',
   delivery_partner_phone VARCHAR(30) DEFAULT '',
   delivery_partner_user_id CHAR(36) NULL,
@@ -402,6 +404,29 @@ CREATE TABLE invoices (
   status ENUM('paid','unpaid') NOT NULL DEFAULT 'unpaid',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ── Online payments (Razorpay) ───────────────────────────────────────────
+-- One row per Razorpay payment the app opens (api/payments.php).
+-- status: created   -> Razorpay order opened; customer hasn't paid (yet)
+--         paid      -> money received but no order saved for it yet. If a
+--                      row stays like this, refund it from the Razorpay
+--                      Dashboard (see api/razorpay_webhook.php)
+--         completed -> order saved; order_id points at it
+CREATE TABLE payments (
+  id CHAR(36) PRIMARY KEY,
+  gateway VARCHAR(20) NOT NULL DEFAULT 'razorpay',
+  gateway_order_id VARCHAR(40) NOT NULL,
+  gateway_payment_id VARCHAR(40) DEFAULT NULL,
+  amount_paise INT NOT NULL,
+  currency CHAR(3) NOT NULL DEFAULT 'INR',
+  status ENUM('created','paid','completed') NOT NULL DEFAULT 'created',
+  order_id CHAR(36) NULL,
+  created_by CHAR(36) NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_gateway_order (gateway_order_id),
+  KEY idx_payments_status (status),
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 -- ── Notifications ────────────────────────────────────────────────────────

@@ -360,24 +360,6 @@ a.nav-link { cursor: pointer; }
   margin-top: 12px; padding: 14px; border: 1px solid var(--border);
   border-radius: var(--radius-sm, 8px); background: var(--bg);
 }
-.pay-tabs { display: flex; gap: 4px; background: var(--surface, #fff); padding: 4px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 4px; }
-.pay-tab {
-  flex: 1; text-align: center; padding: 7px; font-size: 12.5px; font-weight: 500;
-  border-radius: 6px; cursor: pointer; color: var(--text-secondary); user-select: none;
-}
-.pay-tab.active { background: var(--brand-light); color: var(--brand); font-weight: 600; }
-
-.card-preview {
-  margin-top: 10px; border-radius: 12px; padding: 16px 18px;
-  background: linear-gradient(135deg, var(--brand) 0%, #3d3690 100%);
-  color: #fff; font-family: 'DM Sans', sans-serif;
-  display: flex; flex-direction: column; gap: 18px;
-  box-shadow: 0 6px 18px rgba(83,74,183,0.25);
-}
-.card-preview-top { display: flex; justify-content: space-between; font-size: 12px; opacity: 0.9; letter-spacing: 0.02em; }
-.card-preview-number { font-size: 19px; letter-spacing: 2px; font-weight: 600; }
-.card-preview-bottom { display: flex; justify-content: space-between; font-size: 11px; opacity: 0.9; letter-spacing: 0.04em; }
-
 .pay-btn { position: relative; }
 .pay-spinner {
   display: inline-block; width: 13px; height: 13px; border-radius: 50%;

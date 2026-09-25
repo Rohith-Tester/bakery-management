@@ -97,6 +97,7 @@ mysql -u root -p bakery_db < sql/migrate_delivery_charge.sql
 mysql -u root -p bakery_db < sql/migrate_training.sql
 mysql -u root -p bakery_db < sql/seed_training_lessons.sql
 mysql -u root -p bakery_db < sql/migrate_product_reviews.sql
+mysql -u root -p bakery_db < sql/migrate_razorpay_payments.sql
 ```
 
 **If your database still has the old placeholder demo customers**
@@ -478,17 +479,58 @@ When placing an order, the person picks **Cash/Offline** or **Pay Online**:
 
 - **Offline** — the invoice is created `unpaid`; mark it paid later from
   Sales & Billing once cash/card is actually collected.
-- **Online** — a realistic (but fully simulated) checkout: a **Card** tab
-  with a live card preview and formatted number/expiry/CVV inputs, or a
-  **UPI** tab with a UPI ID field and a QR code. "Pay" shows a genuine
-  processing state for ~1.5s, then success with a generated transaction ID.
-  **No real card or bank details are transmitted or stored** — only a fake
-  transaction ID and the card's last 4 digits are saved
-  (`payment_txn_id` / `payment_card_last4`) for the receipt. The invoice is
-  marked `paid` immediately. To wire up a real payment gateway (Razorpay,
-  PayU, Stripe, etc.) later, swap the simulated "Pay" handler in
-  `assets/app.js` (`wirePaymentPanel`) for that gateway's SDK, and use its
-  real transaction ID/webhook instead of `fakeTxnId()`.
+- **Online** — a real payment through **Razorpay** (UPI, cards,
+  netbanking, wallets). "Pay" opens Razorpay's own checkout popup; card and
+  bank details go straight to Razorpay and never touch this server. Once
+  it succeeds the order is placed automatically and its invoice is `paid`.
+  The Razorpay payment ID, method and (for cards) last 4 digits are saved
+  on the order (`payment_txn_id` / `payment_mode` / `payment_card_last4`)
+  for the receipt.
+
+### How an online payment is kept honest
+1. `api/payments.php?action=create` prices the cart **on the server**
+   (`quote_order()` in `api/_bootstrap.php` — the same function the order is
+   saved with), checks stock, and opens a Razorpay order for exactly that
+   amount. It's recorded in the `payments` table as `created`.
+2. The browser runs Razorpay Checkout, which returns a payment ID plus a
+   **signature** made with your secret key.
+3. `api/orders.php` rejects the order unless that signature is valid, the
+   payment was opened by the same logged-in account, and the cart still
+   totals exactly what was paid. The `payments` row becomes `completed`
+   and points at the order. Sending the same payment twice returns the
+   same order — it can never create two.
+4. If the order still can't be saved after the money was taken (an item
+   sold out a moment earlier, say), admins/staff get a notification to
+   refund it, and the customer is told their money is safe.
+5. `api/razorpay_webhook.php` hears about captured payments directly from
+   Razorpay, so a customer who pays and then closes the tab is still
+   recorded. Anything paid without an order shows up with:
+   ```sql
+   SELECT * FROM payments WHERE status = 'paid' AND order_id IS NULL;
+   ```
+   Refund those from the Razorpay Dashboard.
+
+### Setting up Razorpay
+1. Sign up at [razorpay.com](https://razorpay.com) — test mode works
+   immediately, before any KYC.
+2. Dashboard → **Account & Settings → API Keys** → generate **test** keys.
+3. Copy `config/payment.example.php` to `config/payment.php` (git-ignored)
+   and paste in `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET`.
+4. On Windows/XAMPP, PHP has no CA certificate bundle, so calls to
+   Razorpay fail with *"SSL certificate problem"*. Save
+   [cacert.pem](https://curl.se/ca/cacert.pem) as `config/cacert.pem`.
+5. Pay online with Razorpay's
+   [test cards / test UPI IDs](https://razorpay.com/docs/payments/payments/test-card-details/)
+   — no real money moves in test mode.
+6. **Going live:** finish KYC in the Dashboard, generate **live** keys
+   (`rzp_live_…`) and swap them into `config/payment.php`. The site must be
+   on HTTPS. Then add a webhook (Dashboard → Webhooks) pointing at
+   `https://<your-domain>/bakery_php/api/razorpay_webhook.php` for the
+   `payment.captured` event, and put its secret in
+   `RAZORPAY_WEBHOOK_SECRET`.
+
+Refunds for returns are still processed by hand — refund from the Razorpay
+Dashboard, then enter its reference in **Returns & Refunds**.
 
 **Delivery charge:** a flat ₹50 delivery charge is automatically added to
 the order total whenever **both** of these are true:
@@ -498,8 +540,8 @@ the order total whenever **both** of these are true:
 Cash/offline delivery orders and all store-pickup orders are never charged
 this — offline delivery is settled in person, where the shop can handle
 delivery costs however it likes. The charge is calculated and enforced
-**server-side** in `api/orders.php` (the `DELIVERY_CHARGE` constant — change
-the amount there if ₹50 isn't right for you), shown live on the order form
+**server-side** in `api/_bootstrap.php` (the `DELIVERY_CHARGE` constant —
+change the amount there if ₹50 isn't right for you), shown live on the order form
 before checkout (subtotal, delivery charge, and grand total broken out
 separately), and itemized on the printable receipt and the Order Details
 table (a small "incl. ₹50 delivery" note under the total). It's stored per
@@ -544,10 +586,13 @@ bakery_php/
 │   ├── style.css            # All styling
 │   └── app.js                 # SPA logic: routing, rendering, API calls, all modals
 ├── api/                      # PHP REST endpoints (JSON in/out)
-│   ├── _bootstrap.php        # shared headers/helpers/session guard/role checks
+│   ├── _bootstrap.php        # shared headers/helpers/session guard/role checks, order pricing
+│   ├── _razorpay.php          # Razorpay API calls + signature checks
 │   ├── auth.php               # login / register / logout / session check / change password
 │   ├── dashboard.php          # admin only
-│   ├── orders.php              # create/list/update orders (delivery charge lives here)
+│   ├── orders.php              # create/list/update orders (verifies online payments)
+│   ├── payments.php            # opens a Razorpay payment for a cart
+│   ├── razorpay_webhook.php    # public — called by Razorpay, signature-checked
 │   ├── returns.php             # returns & refunds
 │   ├── products.php            # Product Catalog
 │   ├── recipes.php             # Recipe Management
@@ -566,6 +611,8 @@ bakery_php/
 │   └── track.php               # public — no login required
 ├── config/
 │   ├── db.php                # PDO/MySQL connection settings
+│   ├── payment.example.php   # template for payment.php (Razorpay keys, git-ignored)
+│   ├── cacert.pem            # CA bundle so XAMPP's PHP can reach Razorpay over HTTPS
 │   └── session.php           # session bootstrap/cookie hardening
 └── sql/
     ├── schema.sql              # full schema + starter Inventory rows, no demo customers (fresh installs)
@@ -582,7 +629,9 @@ unchanged. Newer/updated endpoints:
 | Endpoint | Method | Notes |
 |---|---|---|
 | `orders.php` | GET | List orders, optional `?status=pending\|baking\|ready\|out_for_delivery\|delivered` |
-| `orders.php` | POST | Create order `{ customerName, items:[{name,qty,price}], deliveryType:'pickup'\|'delivery', deliveryAddress?, paymentMethod:'online'\|'offline', payment? }`. Response includes `deliveryCharge` and a `total` that already has it added. |
+| `orders.php` | POST | Create order `{ customerName, items:[{name,qty,price}], deliveryType:'pickup'\|'delivery', deliveryAddress?, couponCode?, paymentMethod:'online'\|'offline', payment? }`. Online orders need `payment: { razorpayOrderId, razorpayPaymentId, razorpaySignature }` from Razorpay Checkout. Response includes `deliveryCharge` and a `total` that already has it added. |
+| `payments.php?action=create` | POST | Same body as creating an order (minus `payment`). Prices it server-side and returns `{ keyId, razorpayOrderId, amount (paise), currency, businessName }` for Razorpay Checkout. `503` until keys are set in `config/payment.php`. |
+| `razorpay_webhook.php` | POST | **Razorpay only.** Checked against `X-Razorpay-Signature`; marks `payment.captured` payments as paid. |
 | `orders.php?id=X&action=status` | PATCH | Update status `{ status, otp? }` |
 | `orders.php?id=X&action=delivery-partner` | PATCH | Assign a delivery partner |
 | `reviews.php` | GET | No params: bulk `{ itemName: {averageRating, reviewCount} }` summary for every item (product tile badges) |
@@ -636,6 +685,7 @@ unchanged. Newer/updated endpoints:
 | `migrate_delivery_charge.sql` | `delivery_charge` column on orders | `migrate_payment.sql`, `migrate_delivery_partner.sql` |
 | `migrate_training.sql` | `training_materials`, `training_completions` | `migrate_users_roles.sql` |
 | `migrate_product_reviews.sql` | `product_reviews` table | `migrate_customer_orders.sql`, `migrate_delivery_timing.sql` (needs `orders.user_id` and delivered-order tracking) |
+| `migrate_razorpay_payments.sql` | `payments` table (Razorpay), `payment_mode` on orders | `migrate_customer_orders.sql`, `migrate_users_roles.sql` |
 
 ---
 

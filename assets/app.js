@@ -43,6 +43,7 @@ const api = {
 
   getOrders: (status) => req(`${API}/orders.php${status && status !== 'all' ? `?status=${encodeURIComponent(status)}` : ''}`),
   createOrder: (data) => req(`${API}/orders.php`, { method: 'POST', body: data }),
+  createPayment: (data) => req(`${API}/payments.php?action=create`, { method: 'POST', body: data }),
   updateOrderStatus: (id, status, otp) => req(`${API}/orders.php?id=${id}&action=status`, { method: 'PATCH', body: otp ? { status, otp } : { status } }),
   regenerateOrderOtp: (id) => req(`${API}/orders.php?id=${id}&action=regenerate-otp`, { method: 'PATCH', body: {} }),
   deleteOrder: (id) => req(`${API}/orders.php?id=${id}`, { method: 'DELETE' }),
@@ -614,11 +615,13 @@ async function render() {
   $('#topbar-title').textContent = route.indexOf('product/') === 0 ? 'Product Details' : TITLES[route];
   const content = $('#page-content');
   content.innerHTML = spinner();
+  const resumePos = posResumeAfterReload;
+  posResumeAfterReload = false;
 
   try {
     if (route.indexOf('product/') === 0) await renderProductDetail(content, decodeURIComponent(route.slice('product/'.length)));
     else if (route === 'dashboard') await renderDashboard(content);
-    else if (route === 'new-order') await renderNewOrder(content);
+    else if (route === 'new-order') await renderNewOrder(content, resumePos);
     else if (route === 'orders') await renderOrders(content);
     else if (route === 'inventory') await renderInventory(content);
     else if (route === 'suppliers') await renderSuppliers(content);
@@ -750,13 +753,49 @@ let ordersState = { activeTab: 'all', orders: [], customers: [], inventory: [], 
 let posState = {
   customerId: '', customerName: '', phone: '', email: '',
   deliveryType: 'pickup', address: '',
-  paymentMethod: 'offline', payTab: 'card',
-  card: { number: '', name: '', expiry: '', cvv: '' }, upi: { id: '' },
+  paymentMethod: 'offline',
   payState: 'idle', payResult: null,
   cart: {}, cartOpen: false,
   coupon: { code: '', applied: null, error: '', checking: false, autoApplied: false },
   selectedItem: null, selectedItemDetail: null, reviewDraft: { rating: 5, comment: '', imageUrl: '' },
 };
+
+// The New Order cart survives a page refresh: it's saved to this browser
+// tab's sessionStorage whenever the page is left and restored on load.
+// Keyed per account, so a different login in the same tab never sees it;
+// closing the tab (or logging out) still starts fresh.
+const POS_STORAGE_KEY = `bakery_pos_${window.CURRENT_USER_ID}`;
+let posStateSavingDisabled = false;
+// True only for the first render after a reload, so the page reopens on the
+// same step (e.g. the cart drawer) rather than the New Order landing view.
+let posResumeAfterReload = false;
+
+function savePosState() {
+  if (posStateSavingDisabled) return;
+  const { customerId, customerName, phone, email, deliveryType, address, paymentMethod, cart, cartOpen, coupon, payState, payResult } = posState;
+  try {
+    sessionStorage.setItem(POS_STORAGE_KEY, JSON.stringify({
+      customerId, customerName, phone, email, deliveryType, address, paymentMethod, cart, cartOpen,
+      coupon: { code: coupon.code, applied: coupon.applied, autoApplied: coupon.autoApplied },
+      // A finished payment is kept so its order can still be placed after a
+      // refresh; one left open in Razorpay's popup is simply started again.
+      ...(payState === 'success' ? { payState, payResult } : {}),
+    }));
+  } catch (e) { /* storage full or disabled — the cart just won't survive a refresh */ }
+}
+
+function restorePosState() {
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem(POS_STORAGE_KEY) || 'null'); } catch (e) { /* ignore */ }
+  if (!saved) return;
+  Object.assign(posState, saved, { coupon: { ...posState.coupon, ...saved.coupon } });
+  posResumeAfterReload = true;
+}
+
+function clearSavedPosState() {
+  posStateSavingDisabled = true;
+  try { sessionStorage.removeItem(POS_STORAGE_KEY); } catch (e) { /* ignore */ }
+}
 
 function posCartTotal() {
   return Object.values(posState.cart).reduce((s, i) => s + i.price * i.qty, 0);
@@ -861,8 +900,7 @@ function defaultPosState(keepCustomer = false) {
   return {
     ...saved,
     deliveryType: 'pickup', address: '',
-    paymentMethod: 'offline', payTab: 'card',
-    card: { number: '', name: '', expiry: '', cvv: '' }, upi: { id: '' },
+    paymentMethod: 'offline',
     payState: 'idle', payResult: null,
     cart: {}, cartOpen: false,
     coupon: { code: '', applied: null, error: '', checking: false, autoApplied: false },
@@ -876,139 +914,93 @@ function paymentPanelHtml(pay, totalAmount, prefix) {
     <div class="pay-panel pay-success">
       <div style="font-size:32px">✅</div>
       <div style="font-weight:700;margin-top:4px">Payment Successful</div>
-      <div class="text-muted" style="font-size:12.5px;margin-top:4px">Transaction ID: ${esc(pay.payResult.txnId)}</div>
-      <div class="text-muted" style="font-size:12.5px">${pay.payResult.cardLast4 ? 'Card ending ' + esc(pay.payResult.cardLast4) : 'Paid via UPI'} · ₹${inr(totalAmount)}</div>
+      <div class="text-muted" style="font-size:12.5px;margin-top:4px">Payment ID: ${esc(pay.payResult.razorpayPaymentId)}</div>
+      <div class="text-muted" style="font-size:12.5px">₹${inr(pay.payResult.amount)}</div>
     </div>`;
   }
-  const brand = cardBrand(pay.card.number || '');
   return `
   <div class="pay-panel">
-    <div class="pay-tabs">
-      <div class="pay-tab ${pay.payTab === 'card' ? 'active' : ''}" data-pay-tab="${prefix}" data-tab="card">💳 Card</div>
-      <div class="pay-tab ${pay.payTab === 'upi' ? 'active' : ''}" data-pay-tab="${prefix}" data-tab="upi">📱 UPI</div>
-    </div>
-    ${pay.payTab === 'card' ? `
-      <div class="card-preview">
-        <div class="card-preview-top">
-          <span id="${prefix}-cp-brand">${brand.icon} ${brand.name}</span>
-          <span>Golden Crust Bakery Pay</span>
-        </div>
-        <div class="card-preview-number" id="${prefix}-cp-number">${(pay.card.number || '•••• •••• •••• ••••')}</div>
-        <div class="card-preview-bottom">
-          <span id="${prefix}-cp-name">${(pay.card.name || 'CARDHOLDER NAME').toUpperCase()}</span>
-          <span id="${prefix}-cp-expiry">${pay.card.expiry || 'MM/YY'}</span>
-        </div>
-      </div>
-      <div class="form-group" style="margin-top:10px">
-        <label class="form-label">Card number</label>
-        <input class="form-input" id="${prefix}-card-number" inputmode="numeric" maxlength="19" placeholder="1234 5678 9012 3456" value="${esc(pay.card.number)}">
-      </div>
-      <div class="form-row cols-2">
-        <div class="form-group">
-          <label class="form-label">Expiry</label>
-          <input class="form-input" id="${prefix}-card-expiry" maxlength="5" placeholder="MM/YY" value="${esc(pay.card.expiry)}">
-        </div>
-        <div class="form-group">
-          <label class="form-label">CVV</label>
-          <input class="form-input" id="${prefix}-card-cvv" type="password" inputmode="numeric" maxlength="3" placeholder="123" value="${esc(pay.card.cvv)}">
-        </div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Name on card</label>
-        <input class="form-input" id="${prefix}-card-name" placeholder="As shown on card" value="${esc(pay.card.name)}">
-      </div>
-    ` : `
-      <div class="form-group" style="margin-top:10px">
-        <label class="form-label">UPI ID</label>
-        <input class="form-input" id="${prefix}-upi-id" placeholder="yourname@bank" value="${esc(pay.upi.id)}">
-      </div>
-      <div style="text-align:center;padding:12px 0 4px">
-        <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent('upi://pay?pa=bakeandco@upi&pn=Bake%20And%20Co&am=' + totalAmount + '&cu=INR')}"
-             alt="Scan to pay QR code" width="140" height="140" style="border-radius:6px;border:1px solid var(--border)">
-        <div style="font-size:11.5px;color:var(--text-tertiary);margin-top:6px">…or scan with any UPI app</div>
-      </div>
-    `}
+    <div style="font-size:12.5px;color:var(--text-secondary);text-align:center">Pay by UPI, card, netbanking or wallet in Razorpay's secure checkout.</div>
     <button class="btn btn-primary pay-btn" id="${prefix}-pay-submit" style="width:100%;justify-content:center;margin-top:10px" ${pay.payState === 'processing' ? 'disabled' : ''}>
-      ${pay.payState === 'processing' ? '<span class="pay-spinner"></span> Processing payment…' : `🔒 Pay ₹${inr(totalAmount)} securely`}
+      ${pay.payState === 'processing' ? '<span class="pay-spinner"></span> Waiting for payment…' : `🔒 Pay ₹${inr(totalAmount)} securely`}
     </button>
-    <div style="font-size:11px;color:var(--text-tertiary);text-align:center;margin-top:6px">Simulated checkout for demo purposes — no real card/bank details are transmitted.</div>
+    <div style="font-size:11px;color:var(--text-tertiary);text-align:center;margin-top:6px">Card and bank details go straight to Razorpay — this app never sees them.</div>
   </div>`;
 }
 
-function wirePaymentPanel(content, pay, totalAmount, prefix, onRedraw) {
-  $$(`[data-pay-tab="${prefix}"]`, content).forEach(tab => tab.addEventListener('click', () => {
-    pay.payTab = tab.dataset.tab;
-    onRedraw();
-  }));
-
-  const cardNum = $(`#${prefix}-card-number`, content);
-  if (cardNum) cardNum.addEventListener('input', (e) => {
-    const digits = e.target.value.replace(/\D/g, '').slice(0, 16);
-    pay.card.number = digits.replace(/(.{4})/g, '$1 ').trim();
-    e.target.value = pay.card.number;
-    const cpNumber = $(`#${prefix}-cp-number`, content);
-    if (cpNumber) cpNumber.textContent = pay.card.number || '•••• •••• •••• ••••';
-    const cpBrand = $(`#${prefix}-cp-brand`, content);
-    if (cpBrand) { const b = cardBrand(pay.card.number); cpBrand.textContent = `${b.icon} ${b.name}`; }
-  });
-  const cardExp = $(`#${prefix}-card-expiry`, content);
-  if (cardExp) cardExp.addEventListener('input', (e) => {
-    let digits = e.target.value.replace(/\D/g, '').slice(0, 4);
-    if (digits.length >= 3) digits = digits.slice(0, 2) + '/' + digits.slice(2);
-    pay.card.expiry = digits;
-    e.target.value = digits;
-    const cpExpiry = $(`#${prefix}-cp-expiry`, content);
-    if (cpExpiry) cpExpiry.textContent = digits || 'MM/YY';
-  });
-  const cardCvv = $(`#${prefix}-card-cvv`, content);
-  if (cardCvv) cardCvv.addEventListener('input', (e) => {
-    pay.card.cvv = e.target.value.replace(/\D/g, '').slice(0, 3);
-    e.target.value = pay.card.cvv;
-  });
-  const cardName = $(`#${prefix}-card-name`, content);
-  if (cardName) cardName.addEventListener('input', (e) => {
-    pay.card.name = e.target.value;
-    const cpName = $(`#${prefix}-cp-name`, content);
-    if (cpName) cpName.textContent = (e.target.value || 'CARDHOLDER NAME').toUpperCase();
-  });
-  const upiId = $(`#${prefix}-upi-id`, content);
-  if (upiId) upiId.addEventListener('input', (e) => { pay.upi.id = e.target.value; });
-
+// Real online payment through Razorpay Checkout. The server prices the cart
+// and opens a Razorpay order for exactly that amount (api/payments.php),
+// Razorpay's own popup takes the payment, and the signed result goes to
+// onPaid() to place the order — api/orders.php verifies the signature
+// before saving it. getOrderData() returns the same body createOrder will
+// send, or null after telling the user what's missing.
+function wirePaymentPanel(content, pay, totalAmount, prefix, onRedraw, getOrderData, onPaid) {
   const paySubmit = $(`#${prefix}-pay-submit`, content);
-  if (paySubmit) paySubmit.addEventListener('click', async () => {
+  if (!paySubmit) return;
+  paySubmit.addEventListener('click', async () => {
     if (totalAmount <= 0) return toast('Add at least one item first', 'error');
-    if (pay.payTab === 'card') {
-      const digits = pay.card.number.replace(/\s/g, '');
-      if (digits.length < 16) return toast('Enter a valid 16-digit card number', 'error');
-      if (!/^\d{2}\/\d{2}$/.test(pay.card.expiry)) return toast('Enter expiry as MM/YY', 'error');
-      if (pay.card.cvv.length < 3) return toast('Enter a valid CVV', 'error');
-      if (!pay.card.name.trim()) return toast('Enter the name on the card', 'error');
-    } else {
-      if (!/^[\w.\-]{2,}@[a-zA-Z]{2,}$/.test(pay.upi.id.trim())) return toast('Enter a valid UPI ID (e.g. name@bank)', 'error');
-    }
+    const orderData = getOrderData();
+    if (!orderData) return;
+    const resetPay = () => { pay.payState = 'idle'; onRedraw(); };
     pay.payState = 'processing';
     onRedraw();
-    await delay(1500);
-    pay.payState = 'success';
-    pay.payResult = {
-      txnId: fakeTxnId(),
-      cardLast4: pay.payTab === 'card' ? pay.card.number.replace(/\s/g, '').slice(-4) : '',
-    };
-    onRedraw();
-    toast('Payment successful!', 'success');
+
+    let session;
+    try {
+      await loadRazorpayCheckout();
+      session = await api.createPayment(orderData);
+    } catch (err) {
+      resetPay();
+      return toast(err.message, 'error');
+    }
+
+    const checkout = new Razorpay({
+      key: session.keyId,
+      order_id: session.razorpayOrderId,
+      amount: session.amount,
+      currency: session.currency,
+      name: session.businessName,
+      description: 'Bakery order',
+      prefill: { name: orderData.customerName || '', email: orderData.customerEmail || '', contact: orderData.customerPhone || '' },
+      theme: { color: '#534AB7' },
+      handler: (resp) => {
+        pay.payState = 'success';
+        pay.payResult = {
+          razorpayOrderId: resp.razorpay_order_id,
+          razorpayPaymentId: resp.razorpay_payment_id,
+          razorpaySignature: resp.razorpay_signature,
+          amount: session.amount / 100,
+        };
+        onRedraw();
+        toast('Payment successful!', 'success');
+        onPaid();
+      },
+      modal: { ondismiss: () => { if (pay.payState === 'processing') resetPay(); } },
+    });
+    // A declined attempt keeps the checkout open so the customer can try
+    // again or pick another method — just say why it failed.
+    checkout.on('payment.failed', (resp) => toast(`Payment failed: ${resp.error.description}`, 'error'));
+    checkout.open();
   });
 }
 
-function fakeTxnId() {
-  return 'TXN' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
-}
-function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
-function cardBrand(num) {
-  const n = num.replace(/\s/g, '');
-  if (/^4/.test(n)) return { name: 'Visa', icon: '💳' };
-  if (/^5/.test(n)) return { name: 'Mastercard', icon: '💳' };
-  if (/^6/.test(n)) return { name: 'RuPay', icon: '💳' };
-  return { name: 'Card', icon: '💳' };
+// Razorpay's checkout.js is only fetched the first time someone pays online.
+let razorpayCheckoutLoading = null;
+function loadRazorpayCheckout() {
+  if (window.Razorpay) return Promise.resolve();
+  if (!razorpayCheckoutLoading) {
+    razorpayCheckoutLoading = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+      script.onload = resolve;
+      script.onerror = () => {
+        razorpayCheckoutLoading = null;
+        reject(new Error('Could not load the Razorpay checkout — check your internet connection'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return razorpayCheckoutLoading;
 }
 
 function openOrderModal(onSaved) {
@@ -1018,8 +1010,7 @@ function openOrderModal(onSaved) {
     phone: isCustomer ? (posState.phone || '') : '', email: isCustomer ? (posState.email || '') : '',
     deliveryType: 'pickup', address: '', requestedDate: '', notes: '',
     items: [{ name: '', qty: 1, price: 0 }],
-    paymentMethod: 'offline', payTab: 'card',
-    card: { number: '', name: '', expiry: '', cvv: '' }, upi: { id: '' },
+    paymentMethod: 'offline',
     payState: 'idle', // idle | processing | success
     payResult: null,
   };
@@ -1110,7 +1101,7 @@ function openOrderModal(onSaved) {
     </div>
     <div style="padding:12px 0;border-top:1px solid var(--border);margin-top:8px;display:flex;justify-content:space-between;align-items:center">
       <strong>Total: ₹${inr(total())}</strong>
-      ${form.paymentMethod === 'online' && form.payState === 'success' ? `<span style="color:var(--success);font-size:13px;font-weight:600">✓ Paid · ${esc(form.payResult.txnId)}</span>` : ''}
+      ${form.paymentMethod === 'online' && form.payState === 'success' ? `<span style="color:var(--success);font-size:13px;font-weight:600">✓ Paid · ${esc(form.payResult.razorpayPaymentId)}</span>` : ''}
     </div>`;
 
   const footerHtml = () => {
@@ -1124,6 +1115,37 @@ function openOrderModal(onSaved) {
     overlay.querySelector('.modal-body').innerHTML = bodyHtml();
     overlay.querySelector('.modal-footer').innerHTML = footerHtml();
     wire(overlay);
+  };
+
+  // The form as a createOrder body (minus payment), or null after telling
+  // the user what's missing — also what an online payment is opened for.
+  const orderData = () => {
+    if (!form.customerName) { toast('Customer name required', 'error'); return null; }
+    const items = form.items.filter(i => i.name);
+    if (!items.some(i => i.name && i.price > 0)) { toast('Add at least one item', 'error'); return null; }
+    if (form.deliveryType === 'delivery' && !form.address.trim()) { toast('Enter a delivery address', 'error'); return null; }
+    return {
+      customerName: form.customerName, customerId: form.customerId || null,
+      customerPhone: form.phone, customerEmail: form.email,
+      deliveryType: form.deliveryType, deliveryAddress: form.address,
+      requestedDate: form.requestedDate, notes: form.notes,
+      items, paymentMethod: form.paymentMethod,
+    };
+  };
+
+  const saveOrder = async () => {
+    const data = orderData();
+    if (!data) return;
+    if (form.paymentMethod === 'online' && form.payState !== 'success') return toast('Complete payment first', 'error');
+    try {
+      const created = await api.createOrder({ ...data, payment: form.paymentMethod === 'online' ? form.payResult : undefined });
+      toast('Order created!', 'success');
+      closeModal();
+      onSaved();
+      if (form.paymentMethod === 'online') {
+        openReceiptModal({ ...created, amount: created.total }, { title: 'Payment Successful' });
+      }
+    } catch (err) { toast(err.message, 'error'); }
   };
 
   const wire = (overlay) => {
@@ -1180,33 +1202,11 @@ function openOrderModal(onSaved) {
       rerender(overlay);
     }));
 
-    wirePaymentPanel(overlay, form, total(), 'pay', () => rerender(overlay));
+    wirePaymentPanel(overlay, form, total(), 'pay', () => rerender(overlay), orderData, saveOrder);
 
     overlay.querySelector('[data-cancel]').addEventListener('click', closeModal);
     const saveBtn = overlay.querySelector('#ord-save');
-    if (saveBtn) saveBtn.addEventListener('click', async () => {
-      if (!form.customerName) return toast('Customer name required', 'error');
-      const items = form.items.filter(i => i.name);
-      if (!items.some(i => i.name && i.price > 0)) return toast('Add at least one item', 'error');
-      if (form.deliveryType === 'delivery' && !form.address.trim()) return toast('Enter a delivery address', 'error');
-      if (form.paymentMethod === 'online' && form.payState !== 'success') return toast('Complete payment first', 'error');
-      try {
-        const created = await api.createOrder({
-          customerName: form.customerName, customerId: form.customerId || null,
-          customerPhone: form.phone, customerEmail: form.email,
-          deliveryType: form.deliveryType, deliveryAddress: form.address,
-          requestedDate: form.requestedDate, notes: form.notes,
-          items, paymentMethod: form.paymentMethod,
-          payment: form.paymentMethod === 'online' ? form.payResult : undefined,
-        });
-        toast('Order created!', 'success');
-        closeModal();
-        onSaved();
-        if (form.paymentMethod === 'online') {
-          openReceiptModal({ ...created, amount: created.total }, { title: 'Payment Successful' });
-        }
-      } catch (err) { toast(err.message, 'error'); }
-    });
+    if (saveBtn) saveBtn.addEventListener('click', saveOrder);
   };
 
   openModal({ title: 'New Order', bodyHtml: bodyHtml(), footerHtml: footerHtml(), onMount: wire });
@@ -1465,7 +1465,7 @@ function cartDrawerHtml() {
 
         ${posState.paymentMethod === 'online' ? paymentPanelHtml(posState, total, 'pos-pay') : ''}
 
-        ${posState.paymentMethod === 'online' && posState.payState === 'success' ? `<div style="color:var(--success);font-size:12px;font-weight:600;margin-bottom:8px;text-align:center">✓ Paid · ${esc(posState.payResult.txnId)}</div>` : ''}
+        ${posState.paymentMethod === 'online' && posState.payState === 'success' ? `<div style="color:var(--success);font-size:12px;font-weight:600;margin-bottom:8px;text-align:center">✓ Paid · ${esc(posState.payResult.razorpayPaymentId)}</div>` : ''}
 
         <button class="btn btn-primary" id="pos-place-order" style="width:100%;justify-content:center;margin-top:8px" ${cartItems.length === 0 || (posState.paymentMethod === 'online' && posState.payState !== 'success') ? 'disabled' : ''}>${placeLabel}</button>
       </div>
@@ -1668,25 +1668,30 @@ function wirePosPanel(content, onOrderPlaced) {
     onOrderPlaced.redraw();
   }));
 
-  wirePaymentPanel(content, posState, Math.max(0, posCartTotal() - posDiscountAmount() + deliveryChargeFor(posState)), 'pos-pay', onOrderPlaced.redraw);
-
-  const placeBtn = $('#pos-place-order', content);
-  if (placeBtn) placeBtn.addEventListener('click', async () => {
+  // The cart as a createOrder body (minus payment), or null after telling
+  // the user what's missing — also what an online payment is opened for.
+  const posOrderData = () => {
     const items = Object.values(posState.cart).map(i => ({ name: i.name, qty: i.qty, price: i.price }));
-    if (!items.length) return toast('Add at least one item', 'error');
+    if (!items.length) { toast('Add at least one item', 'error'); return null; }
     const customerName = isCustomer ? (posState.customerName || window.CURRENT_USERNAME || '') : posState.customerName.trim();
-    if (!customerName) return toast('Customer name required', 'error');
-    if (posState.deliveryType === 'delivery' && !posState.address.trim()) return toast('Enter a delivery address', 'error');
+    if (!customerName) { toast('Customer name required', 'error'); return null; }
+    if (posState.deliveryType === 'delivery' && !posState.address.trim()) { toast('Enter a delivery address', 'error'); return null; }
+    return {
+      customerName, customerId: posState.customerId || null, customerPhone: posState.phone, customerEmail: posState.email || '',
+      deliveryType: posState.deliveryType, deliveryAddress: posState.address,
+      items, paymentMethod: posState.paymentMethod,
+      couponCode: posState.coupon.applied ? posState.coupon.applied.code : '',
+    };
+  };
+
+  const placePosOrder = async () => {
+    const data = posOrderData();
+    if (!data) return;
     if (posState.paymentMethod === 'online' && posState.payState !== 'success') return toast('Complete payment first', 'error');
 
     const payment = posState.paymentMethod === 'online' ? posState.payResult : undefined;
     try {
-      const created = await api.createOrder({
-        customerName, customerId: posState.customerId || null, customerPhone: posState.phone, customerEmail: posState.email || '',
-        deliveryType: posState.deliveryType, deliveryAddress: posState.address,
-        items, paymentMethod: posState.paymentMethod, payment,
-        couponCode: posState.coupon.applied ? posState.coupon.applied.code : '',
-      });
+      const created = await api.createOrder({ ...data, payment });
       toast('Order created!', 'success');
       const wasOnline = posState.paymentMethod === 'online';
       posState = defaultPosState(isCustomer);
@@ -1695,7 +1700,12 @@ function wirePosPanel(content, onOrderPlaced) {
         openReceiptModal({ ...created, amount: created.total }, { title: 'Payment Successful' });
       }
     } catch (err) { toast(err.message, 'error'); }
-  });
+  };
+
+  wirePaymentPanel(content, posState, Math.max(0, posCartTotal() - posDiscountAmount() + deliveryChargeFor(posState)), 'pos-pay', onOrderPlaced.redraw, posOrderData, placePosOrder);
+
+  const placeBtn = $('#pos-place-order', content);
+  if (placeBtn) placeBtn.addEventListener('click', placePosOrder);
 }
 
 async function renderProductDetail(content, itemName) {
@@ -1924,7 +1934,7 @@ async function renderProductDetail(content, itemName) {
   draw();
 }
 
-async function renderNewOrder(content) {
+async function renderNewOrder(content, resumeAfterReload) {
   // posState is a single global object shared with the Product Details page
   // (so "Buy Now" there can open the same cart drawer). That's fine while
   // you stay on one page, but it meant cartOpen/cartOpen-style flags kept
@@ -1932,8 +1942,9 @@ async function renderNewOrder(content) {
   // pressing Back and then re-entering New Order from the nav could land
   // you straight on the "place order" cart drawer instead of the plain New
   // Order landing view. Every fresh navigation onto this page should start
-  // from the landing view, not mid-checkout.
-  posState.cartOpen = false;
+  // from the landing view, not mid-checkout — except a browser refresh,
+  // which should put you back exactly where you were.
+  if (!resumeAfterReload) posState.cartOpen = false;
   const isCustomer = window.CURRENT_ROLE === 'customer';
   const [customers, products, settings, profile, reviewSummaryData, activeCouponsData] = await Promise.all([
     isCustomer ? Promise.resolve([]) : api.getCustomers(),
@@ -4547,6 +4558,14 @@ async function renderSettings(content) {
 
 
 // ── Receipts / Payment Slips ─────────────────────────────────────────────
+// How an order was paid, as Razorpay reported it (orders.payment_mode).
+function paymentModeLabel(r) {
+  if (r.paymentMethod !== 'online') return 'Cash / Offline';
+  if (r.paymentCardLast4) return 'Card ending ' + r.paymentCardLast4;
+  const modes = { upi: 'UPI', card: 'Card', netbanking: 'Netbanking', wallet: 'Wallet', emi: 'EMI', paylater: 'Pay Later' };
+  return modes[r.paymentMode] || 'Online';
+}
+
 // Builds a self-contained, printable HTML receipt for a paid order/invoice.
 // Used both right after an online checkout succeeds, and from the Sales &
 // Billing (payment history) page for any settled invoice.
@@ -4586,9 +4605,7 @@ function receiptHtml(r) {
   <div class="row"><span>Date</span><span>${new Date((r.createdAt || '').replace(' ', 'T')).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div>
   <div class="row"><span>Customer</span><span>${esc(r.customerName || '')}</span></div>
   ${isOnline ? `<div class="row"><span>Transaction ID</span><span>${esc(r.paymentTxnId || '')}</span></div>` : ''}
-  ${isOnline && r.paymentCardLast4 ? `<div class="row"><span>Payment method</span><span>Card ending ${esc(r.paymentCardLast4)}</span></div>` : ''}
-  ${isOnline && !r.paymentCardLast4 ? `<div class="row"><span>Payment method</span><span>UPI</span></div>` : ''}
-  ${!isOnline ? `<div class="row"><span>Payment method</span><span>Cash / Offline</span></div>` : ''}
+  <div class="row"><span>Payment method</span><span>${esc(paymentModeLabel(r))}</span></div>
   ${items.length ? `
   <table>
     <thead><tr><th>Item</th><th class="right">Qty</th><th class="right">Amount</th></tr></thead>
@@ -4636,7 +4653,7 @@ function openReceiptModal(r, opts = {}) {
     <div style="border:1px solid var(--border);border-radius:10px;padding:14px;font-size:13px">
       <div style="display:flex;justify-content:space-between;padding:4px 0"><span class="text-muted">Customer</span><span class="font-medium">${esc(r.customerName || '')}</span></div>
       ${isOnline ? `<div style="display:flex;justify-content:space-between;padding:4px 0"><span class="text-muted">Transaction ID</span><span class="font-medium">${esc(r.paymentTxnId || '')}</span></div>` : ''}
-      <div style="display:flex;justify-content:space-between;padding:4px 0"><span class="text-muted">Payment method</span><span class="font-medium">${isOnline ? (r.paymentCardLast4 ? 'Card ending ' + esc(r.paymentCardLast4) : 'UPI') : 'Cash / Offline'}</span></div>
+      <div style="display:flex;justify-content:space-between;padding:4px 0"><span class="text-muted">Payment method</span><span class="font-medium">${esc(paymentModeLabel(r))}</span></div>
       ${r.deliveryCharge > 0 ? `<div style="display:flex;justify-content:space-between;padding:4px 0"><span class="text-muted">🚚 Delivery charge</span><span class="font-medium">₹${inr(r.deliveryCharge)}</span></div>` : ''}
       ${r.discountAmount > 0 ? `<div style="display:flex;justify-content:space-between;padding:4px 0"><span class="text-muted">🏷️ Discount${r.couponCode ? ` (${esc(r.couponCode)})` : ''}</span><span class="font-medium" style="color:var(--success)">−₹${inr(r.discountAmount)}</span></div>` : ''}
       <div style="display:flex;justify-content:space-between;padding-top:8px;margin-top:6px;border-top:1px solid var(--border);font-weight:700;font-size:15px"><span>Total Paid</span><span>₹${inr(r.amount != null ? r.amount : r.total)}</span></div>
@@ -5854,10 +5871,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#sidebar-backdrop').addEventListener('click', closeSidebar);
   $('#btn-logout').addEventListener('click', () => {
     confirmDialog('Sign out of Golden Crust Bakery?', async () => {
+      clearSavedPosState();
       try { await api.logout(); } catch (e) { /* ignore */ }
       window.location.href = 'login.php';
     });
   });
+  restorePosState();
+  window.addEventListener('pagehide', savePosState);
   initNotifications();
   render();
   if (window.CURRENT_ROLE === 'customer') maybeShowWelcomeCouponPopup();

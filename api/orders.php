@@ -1,16 +1,10 @@
 <?php
 require __DIR__ . '/_bootstrap.php';
+require __DIR__ . '/_razorpay.php';
 $pdo = db();
 $method = $_SERVER['REQUEST_METHOD'];
 $id = ga($_GET, 'id', null);
 $action = ga($_GET, 'action', null);
-
-// Flat delivery charge automatically applied when a customer books home
-// delivery AND pays online at checkout. Store-pickup orders and
-// cash/offline orders are never charged this (offline delivery orders are
-// settled in person, where the shop can collect delivery costs however it
-// likes without needing it itemized here).
-define('DELIVERY_CHARGE', 50.00);
 
 function fetch_order_with_items($pdo, $id) {
     $stmt = $pdo->prepare("SELECT * FROM orders WHERE id = ?");
@@ -47,6 +41,7 @@ function fetch_order_with_items($pdo, $id) {
         'paymentMethod' => $o['payment_method'],
         'paymentTxnId' => $o['payment_txn_id'],
         'paymentCardLast4' => $o['payment_card_last4'],
+        'paymentMode' => isset($o['payment_mode']) ? $o['payment_mode'] : '',
         'invoiceNumber' => $invRow ? $invRow['invoice_number'] : null,
         'invoiceStatus' => $invRow ? $invRow['status'] : null,
         'deliveryPartnerName' => isset($o['delivery_partner_name']) ? $o['delivery_partner_name'] : '',
@@ -102,22 +97,12 @@ if ($method === 'POST') {
     }
     $notes = trim(ga($body, 'notes', ''));
     $couponCode = trim(ga($body, 'couponCode', ''));
-    // Simulated online-payment result from the client-side "checkout" —
-    // never real card data (see api/orders.php note below), just a
-    // transaction reference + last 4 digits for the receipt/invoice.
-    $payment = ga($body, 'payment', array());
-    $paymentTxnId = $paymentMethod === 'online' ? trim(ga($payment, 'txnId', '')) : '';
-    $paymentCardLast4 = $paymentMethod === 'online' ? preg_replace('/\D/', '', ga($payment, 'cardLast4', '')) : '';
-    $paymentCardLast4 = substr($paymentCardLast4, -4);
 
     if (!$customerName || !count($items)) {
         send_error('customerName and items required');
     }
     if ($deliveryType === 'delivery' && !$deliveryAddress) {
         send_error('Delivery address is required for home delivery');
-    }
-    if ($paymentMethod === 'online' && !$paymentTxnId) {
-        send_error('Online payment was not completed');
     }
 
     // Customer accounts always order for themselves, using their own
@@ -127,87 +112,82 @@ if ($method === 'POST') {
         $userId = $_SESSION['user_id'];
     }
 
-    // ── Validate items against the Product Catalog (not raw inventory —
-    //    customers order finished products, e.g. "Chocolate Cake", never
-    //    raw ingredients like "Flour"). Stock availability is derived from
-    //    each product's linked Recipe: if a product has a recipe, the
-    //    order can't exceed how many units that recipe's ingredients can
-    //    currently produce. Products with no recipe linked yet are treated
-    //    as stock-untracked (always orderable while marked available). ──
-    $neededByName = array();
-    foreach ($items as $it) {
-        $name = trim(ga($it, 'name', ''));
-        $qty = (float)ga($it, 'qty', 0);
-        if ($name === '' || $qty <= 0) continue;
-        $neededByName[$name] = (isset($neededByName[$name]) ? $neededByName[$name] : 0) + $qty;
-    }
-
-    // Price is NEVER trusted from the client — it's recomputed here from
-    // each item's real Product Catalog selling_price. This closes off the
-    // obvious attack of editing the request to set an arbitrary/zero price.
-    $trustedPriceByName = array();
-    $productByName = array();
-    foreach ($neededByName as $name => $need) {
-        $prodStmt = $pdo->prepare("SELECT * FROM products WHERE name = ? AND is_available = 1");
-        $prodStmt->execute(array($name));
-        $prodRow = $prodStmt->fetch();
-        $trustedPriceByName[$name] = $prodRow ? (float)$prodRow['selling_price'] : 0;
-        $productByName[$name] = $prodRow ?: null;
-    }
-
-    foreach ($neededByName as $name => $need) {
-        if (!$productByName[$name]) {
-            send_error('"' . $name . '" is not a valid or available product');
+    // ── Online payment: must be a Razorpay payment for a payments row this
+    //    server opened (api/payments.php), carrying Razorpay's signature —
+    //    so the browser can't just claim it paid. Card/bank details never
+    //    reach this server; only Razorpay's IDs are stored for the receipt. ──
+    $paymentRow = null;
+    $paymentTxnId = '';
+    $paymentCardLast4 = '';
+    $paymentMode = '';
+    if ($paymentMethod === 'online') {
+        $payment = ga($body, 'payment', array());
+        $rzpOrderId = trim((string)ga($payment, 'razorpayOrderId', ''));
+        $rzpPaymentId = trim((string)ga($payment, 'razorpayPaymentId', ''));
+        $rzpSignature = trim((string)ga($payment, 'razorpaySignature', ''));
+        if (!$rzpOrderId || !$rzpPaymentId || !$rzpSignature) {
+            send_error('Online payment was not completed');
+        }
+        if (!razorpay_verify_payment_signature($rzpOrderId, $rzpPaymentId, $rzpSignature)) {
+            send_error('Payment could not be verified');
+        }
+        $payStmt = $pdo->prepare("SELECT * FROM payments WHERE gateway_order_id = ?");
+        $payStmt->execute(array($rzpOrderId));
+        $paymentRow = $payStmt->fetch();
+        if (!$paymentRow || $paymentRow['created_by'] !== $_SESSION['user_id']) {
+            send_error('Payment not found');
+        }
+        // Sent again after the order was already saved (e.g. the first
+        // response was lost on a flaky connection) — hand back that order
+        // instead of creating a second one for the same payment.
+        if ($paymentRow['order_id']) {
+            send(fetch_order_with_items($pdo, $paymentRow['order_id']));
+        }
+        $pdo->prepare("UPDATE payments SET status = 'paid', gateway_payment_id = ? WHERE id = ? AND order_id IS NULL")
+            ->execute(array($rzpPaymentId, $paymentRow['id']));
+        $paymentRow['gateway_payment_id'] = $rzpPaymentId;
+        $paymentTxnId = $rzpPaymentId;
+        try {
+            $rzpPayment = razorpay_fetch_and_capture($rzpPaymentId, (int)$paymentRow['amount_paise'], $paymentRow['currency']);
+            $paymentMode = (string)ga($rzpPayment, 'method', '');
+            if (isset($rzpPayment['card']['last4'])) {
+                $paymentCardLast4 = substr(preg_replace('/\D/', '', $rzpPayment['card']['last4']), -4);
+            }
+        } catch (RuntimeException $e) {
+            // The signature already proves the payment is genuine — these
+            // details only decorate the receipt, so don't fail the order.
+            error_log('Razorpay payment lookup failed for ' . $rzpPaymentId . ': ' . $e->getMessage());
         }
     }
 
-    // Expand each product's ordered quantity into raw-ingredient demand via
-    // its linked recipe (quantity per ingredient is defined per recipe
-    // batch, which yields yield_qty finished units).
-    $inventoryNeeded = array(); // item_id => quantity needed
-    foreach ($neededByName as $name => $need) {
-        $prodRow = $productByName[$name];
-        if (!$prodRow || !$prodRow['recipe_id']) continue; // stock-untracked product
-        $ingStmt = $pdo->prepare(
-            "SELECT ri.item_id, ri.quantity, r.yield_qty FROM recipe_ingredients ri
-             JOIN recipes r ON r.id = ri.recipe_id WHERE ri.recipe_id = ?"
-        );
-        $ingStmt->execute(array($prodRow['recipe_id']));
-        foreach ($ingStmt->fetchAll() as $ing) {
-            $yieldQty = (float)$ing['yield_qty'] > 0 ? (float)$ing['yield_qty'] : 1;
-            $perUnit = (float)$ing['quantity'] / $yieldQty;
-            $itemId = $ing['item_id'];
-            $inventoryNeeded[$itemId] = (isset($inventoryNeeded[$itemId]) ? $inventoryNeeded[$itemId] : 0) + ($perUnit * $need);
+    // Once money has been taken, any reason the order still can't be saved
+    // (an item sold out meanwhile, a coupon used up, …) must reach a person,
+    // or the customer is charged for nothing. The payments row stays 'paid'
+    // with no order_id, so it's easy to find and refund.
+    $fail = function ($message, $code = 400) use ($pdo, $paymentRow) {
+        if ($paymentRow) {
+            $amount = '₹' . number_format($paymentRow['amount_paise'] / 100, 2);
+            $reason = preg_replace('/^(.{0,120}).*$/us', '$1', $message);
+            notify_management($pdo, null, "Payment {$paymentRow['gateway_payment_id']} ({$amount}) received but order failed: {$reason} — refund from Razorpay Dashboard if needed.");
+            send_error($message . " Your payment of {$amount} was received — the bakery has been notified and will refund it if the order can't go through.", $code);
         }
-    }
+        send_error($message, $code);
+    };
 
-    $total = 0;
-    foreach ($items as $it) {
-        $name = trim(ga($it, 'name', ''));
-        $qty = (float)ga($it, 'qty', 0);
-        $price = isset($trustedPriceByName[$name]) ? $trustedPriceByName[$name] : 0;
-        $total += $price * $qty;
-    }
+    // Trusted prices, coupon and delivery charge — see quote_order() in
+    // _bootstrap.php, the same pricing payments.php charged online with.
+    $quote = quote_order($pdo, $items, $couponCode, $deliveryType, $userId);
+    if (!$quote['ok']) $fail($quote['error']);
+    $total = $quote['total'];
+    $trustedPriceByName = $quote['trustedPriceByName'];
+    $inventoryNeeded = $quote['inventoryNeeded'];
+    $discountAmount = $quote['discountAmount'];
+    $appliedCouponCode = $quote['couponCode'];
+    $deliveryCharge = $quote['deliveryCharge'];
 
-    // Coupon discount applies to the items subtotal, before the delivery
-    // charge is added — re-validated here from scratch (never trust a
-    // discount amount computed client-side) using the exact same rules the
-    // live checkout-time check in api/coupons.php used.
-    $discountAmount = 0;
-    $appliedCouponCode = null;
-    if ($couponCode !== '') {
-        $couponResult = evaluate_coupon($pdo, $couponCode, $total, $userId);
-        if (!$couponResult['ok']) send_error($couponResult['error']);
-        $discountAmount = $couponResult['discountAmount'];
-        $appliedCouponCode = $couponResult['coupon']['code'];
-        $total -= $discountAmount;
+    if ($paymentRow && (int)round($total * 100) !== (int)$paymentRow['amount_paise']) {
+        $fail('The cart changed after payment, so the order total no longer matches the amount paid.');
     }
-
-    // Delivery charge applies to any home-delivery order, regardless of
-    // payment method (cash/offline or online) — it's a delivery fee, not
-    // a payment-method surcharge.
-    $deliveryCharge = ($deliveryType === 'delivery') ? DELIVERY_CHARGE : 0.00;
-    $total += $deliveryCharge;
 
     $countStmt = $pdo->query("SELECT COUNT(*) FROM orders");
     $orderNumber = 'ORD-' . str_pad((string)($countStmt->fetchColumn() + 1), 3, '0', STR_PAD_LEFT);
@@ -217,6 +197,19 @@ if ($method === 'POST') {
 
     $pdo->beginTransaction();
     try {
+        // Two submits of the same payment (a double click, or a retry racing
+        // the first request) serialize on its row here — only one of them
+        // creates the order; the other gets that order back.
+        if ($paymentRow) {
+            $lockPayStmt = $pdo->prepare("SELECT order_id FROM payments WHERE id = ? FOR UPDATE");
+            $lockPayStmt->execute(array($paymentRow['id']));
+            $existingOrderId = $lockPayStmt->fetchColumn();
+            if ($existingOrderId) {
+                $pdo->rollBack();
+                send(fetch_order_with_items($pdo, $existingOrderId));
+            }
+        }
+
         // Lock every needed inventory row FOR UPDATE first, so concurrent
         // orders serialize on these rows instead of both reading stale
         // "available" quantities and both passing the check.
@@ -227,11 +220,11 @@ if ($method === 'POST') {
             $invRow = $lockStmt->fetch();
             if (!$invRow) {
                 $pdo->rollBack();
-                send_error('A required ingredient no longer exists in inventory');
+                $fail('A required ingredient no longer exists in inventory');
             }
             if ($need > (float)$invRow['quantity']) {
                 $pdo->rollBack();
-                send_error('Not enough "' . $invRow['name'] . '" in stock to make this order (only ' . $invRow['quantity'] . ' left)');
+                $fail('Not enough "' . $invRow['name'] . '" in stock to make this order (only ' . $invRow['quantity'] . ' left)');
             }
             $stockNeeded[$invRow['id']] = $need;
         }
@@ -240,14 +233,14 @@ if ($method === 'POST') {
             "INSERT INTO orders (id, order_number, customer_id, user_id, customer_name, customer_phone, customer_email,
                                   delivery_type, delivery_address, requested_date, notes, total, delivery_charge,
                                   coupon_code, discount_amount, status,
-                                  payment_method, payment_txn_id, payment_card_last4, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)"
+                                  payment_method, payment_txn_id, payment_card_last4, payment_mode, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
         );
         $stmt->execute(array(
             $newId, $orderNumber, $customerId ? $customerId : null, $userId, $customerName, $customerPhone, $customerEmail,
             $deliveryType, $deliveryAddress, $requestedDate, $notes, $total, $deliveryCharge,
             $appliedCouponCode, $discountAmount,
-            $paymentMethod, $paymentTxnId, $paymentCardLast4, $now,
+            $paymentMethod, $paymentTxnId, $paymentCardLast4, $paymentMode, $now,
         ));
 
         // Coupon redemption count is incremented inside the same transaction
@@ -271,9 +264,9 @@ if ($method === 'POST') {
             $deductStmt->execute(array($need, $invId));
         }
 
-        // Online payments are captured (simulated) at checkout time, so the
-        // invoice is paid immediately; offline/cash orders stay unpaid
-        // until marked delivered.
+        // Online payments were verified with Razorpay above, so the invoice
+        // is paid immediately; offline/cash orders stay unpaid until marked
+        // delivered.
         $invoiceStatus = $paymentMethod === 'online' ? 'paid' : 'unpaid';
 
         $invCountStmt = $pdo->query("SELECT COUNT(*) FROM invoices");
@@ -284,10 +277,15 @@ if ($method === 'POST') {
         );
         $invStmt->execute(array(uuid4(), $invoiceNumber, $newId, $orderNumber, $customerId ? $customerId : null, $customerName, $total, $invoiceStatus, $now));
 
+        if ($paymentRow) {
+            $pdo->prepare("UPDATE payments SET order_id = ?, status = 'completed' WHERE id = ?")
+                ->execute(array($newId, $paymentRow['id']));
+        }
+
         $pdo->commit();
     } catch (Exception $e) {
         $pdo->rollBack();
-        send_error('Failed to create order: ' . $e->getMessage(), 500);
+        $fail('Failed to create order: ' . $e->getMessage(), 500);
     }
 
     notify_management($pdo, $newId, "New order {$orderNumber} from {$customerName} (₹" . number_format($total, 0) . ")");

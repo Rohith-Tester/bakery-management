@@ -30,6 +30,7 @@ function fmt_invoice($r) {
         'paymentMethod' => isset($r['payment_method']) ? $r['payment_method'] : null,
         'paymentTxnId' => isset($r['payment_txn_id']) ? $r['payment_txn_id'] : null,
         'paymentCardLast4' => isset($r['payment_card_last4']) ? $r['payment_card_last4'] : null,
+        'paymentMode' => isset($r['payment_mode']) ? $r['payment_mode'] : '',
         'customerPhone' => isset($r['customer_phone']) ? $r['customer_phone'] : '',
         'customerEmail' => isset($r['customer_email']) ? $r['customer_email'] : '',
     );
@@ -37,7 +38,7 @@ function fmt_invoice($r) {
 
 if ($method === 'GET' && !$id && !$orderId) {
     $rows = $pdo->query(
-        "SELECT inv.*, o.payment_method, o.payment_txn_id, o.payment_card_last4, o.customer_phone, o.customer_email
+        "SELECT inv.*, o.payment_method, o.payment_txn_id, o.payment_card_last4, o.payment_mode, o.customer_phone, o.customer_email
          FROM invoices inv
          LEFT JOIN orders o ON o.id = inv.order_id
          ORDER BY inv.created_at DESC"
@@ -62,7 +63,7 @@ if ($method === 'GET' && !$id && !$orderId) {
 if ($method === 'GET' && ($id || $orderId) && $action === 'receipt') {
     if ($orderId) {
         $stmt = $pdo->prepare(
-            "SELECT inv.*, o.payment_method, o.payment_txn_id, o.payment_card_last4, o.customer_phone, o.customer_email,
+            "SELECT inv.*, o.payment_method, o.payment_txn_id, o.payment_card_last4, o.payment_mode, o.customer_phone, o.customer_email,
                     o.delivery_type, o.delivery_address, o.delivery_charge, o.discount_amount, o.coupon_code,
                     o.id AS order_pk, o.user_id AS order_user_id
              FROM invoices inv
@@ -73,7 +74,7 @@ if ($method === 'GET' && ($id || $orderId) && $action === 'receipt') {
         $stmt->execute(array($orderId));
     } else {
         $stmt = $pdo->prepare(
-            "SELECT inv.*, o.payment_method, o.payment_txn_id, o.payment_card_last4, o.customer_phone, o.customer_email,
+            "SELECT inv.*, o.payment_method, o.payment_txn_id, o.payment_card_last4, o.payment_mode, o.customer_phone, o.customer_email,
                     o.delivery_type, o.delivery_address, o.delivery_charge, o.discount_amount, o.coupon_code,
                     o.id AS order_pk, o.user_id AS order_user_id
              FROM invoices inv
